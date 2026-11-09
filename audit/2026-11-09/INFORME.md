@@ -234,3 +234,40 @@ cast code 0xd551F33Ca8eCb0Be83d8799D9C68a368BA36Dd52 --rpc-url <rpc> > socket.he
 ## 10. Resumen de una línea
 
 Con el código de v2.2.4 en mano, **el camino permissionless no existe**: cada salida de valor exige firma de rol + segunda barrera (multisig m-de-n, mayoría de relayers o Council>1/2); el único atajo barato a control total es la gobernanza con ejecución Root (`Democracy` + `MinimumDeposit 20 000 BFC`, sin quórum), que tu regla excluye como crítico; y el hueco que impide cerrar el veredicto en términos absolutos es el **bytecode de los contratos EVM desplegados**, que no está en ningún repo de la org.
+
+---
+
+## 11. Segunda pasada (revisión dirigida, 2026-11-09)
+
+Barrido adicional sobre `btc-socket-queue` (`on_initialize` y `composite_psbt`), `blaze` (selección de monedas BNB/Knapsack), `bfc-offences`, `bfc-staking` (cobro de recompensas), `bfc-utility`, `safe-mode`, `im-online` y las 197 claves del genesis. **El veredicto del §10 no cambia**: no apareció ningún camino permissionless de robo. Resultados nuevos:
+
+### 11.1 Hallazgo nuevo (Medio; pérdida del propio usuario, no robo)
+
+Los mensajes de socket con `params.amount <= 546` sats (`DUST_LIMIT`, `primitives/btc-relay/src/lib.rs:36`) **se descartan del PSBT pero siguen sumando al `target`**:
+
+- `pallets/btc-socket-queue/src/pallet/impls.rs:520` filtra `value > 546` **después** de agregar los outputs por `script_pubkey`.
+- El `target` del selector se calcula con `outbound_amount_sum` = suma de **todos** los mensajes (`pallet/mod.rs:268` y `:287`) y ese mismo valor se pasa a `composite_psbt` como `target` (`pallet/mod.rs:322`).
+- Consecuencia: el importe del mensaje descartado no se paga al usuario, no se devuelve, y se convierte en fee del minero (o se resta del cambio al vault si la estrategia es Knapsack).
+- No hay validación de importe mínimo en `verify_socket_message` (`impls.rs:44-97`) ni en la ruta de encolado del pallet.
+
+Ganancia del atacante: **ninguna** (el fee va al minero de Bitcoin, que no elige qué transacción incluye); es pérdida silenciosa de fondos del propio usuario. Para cerrarlo: rechazar o redondear los mensajes ≤ dust antes de encolar, y calcular `target` sobre los outputs efectivos.
+
+### 11.2 Falsos positivos nuevos (descartados, con el hecho que los mata)
+
+| Candidato | Hecho que lo mata |
+|---|---|
+| El cambio del excedente sólo se crea con `Knapsack`, así que el exceso se pierde como fee | El selector BNB poda `curr_value > target + cost_of_change` (`pallets/blaze/src/pallet/impls.rs:311`) y sólo acepta selecciones con exceso ≤ `cost_of_change = 43·fee_rate` (`btc-socket-queue/src/pallet/mod.rs:308`). Es el comportamiento estándar de Bitcoin Core (evitar el cambio): el exceso no devuelto está acotado por el coste de crear el output de cambio, no es una fuga. |
+| `SafeMode` con `EnterDepositAmount = None` ⇒ cualquiera congela la cadena 12 h | Con depósito `None`, `do_enter`/`do_extend` devuelven `NotConfigured` (`substrate/frame/safe-mode/src/lib.rs:476` y `:495`): `enter`/`extend` firmados **no existen** en esta configuración. Safe mode es Root-only (`ForceEnter/Extend/Exit`). |
+| `ImOnline.ReportUnresponsiveness = Offences` permite acusar a un validador honesto y hacerle slash | `on_before_session_ending` calcula los offenders por **heartbeats ausentes propios** (`is_online_aux`, `substrate/frame/im-online/src/lib.rs:805-819`); el campo `validators_len` del heartbeat no se usa para acusar a nadie. No hay acusación dirigida por un tercero. |
+| `lock_utxos(...).unwrap()` en `on_initialize` ⇒ halt determinista | Sólo falla si un UTXO seleccionado no existe en `Utxos`; y `selected_utxos ⊆ get_utxos()` en la misma llamada (`pallets/blaze/src/pallet/impls.rs:68-80` y `:96-111`). No alcanzable. |
+| `.expect("Graceful validator reward payout")` (`pallets/bfc-staking/src/pallet/impls.rs:539/552`) ⇒ halt si el stash está muerto | El único `Err` propagable es `bond_more → reserve(reward)`, y va precedido de `mint_reward(stash)`, que sube el `free` balance exactamente en `reward`. Un candidato vivo tiene el bono reservado (>0), así que su cuenta no puede ser reaped. No alcanzable en operación normal. |
+| `refresh_offences` con resta sin `saturating_sub` (`pallets/bfc-offences/src/pallet/impls.rs:78`) ⇒ panic | Sólo desborda si el índice de sesión retrocede (reset/reorg de sesiones), no accionable por un usuario. Sin panic en operación normal. |
+| `bfc-utility` mueve Currency | `mint_native` exige `MintableOrigin` (Council > 1/2); `community_proposal`, `add_blocked_account` y `remove_blocked_account` son `ensure_root`. Nada permissionless. |
+
+### 11.3 Genesis: prefijos cerrados
+
+De las 197 claves de `genesis.raw.top`, **todas** las de primer nivel quedan identificadas al añadir los nombres del runtime (`#[frame_support::runtime]`, `runtime/mainnet/src/lib.rs:1148-1256`) y los prefijos bien conocidos (`:code`, `:extrinsic_index`, `:ethereum_schema`, `:grandpa_authorities`). La única que no corresponde a un pallet con estado es `bd2a5293…4e7b9012…`: su segundo half es `twox128(":__STORAGE_VERSION__:")` y vale `0x0000`, es decir, el marcador de versión de storage de un pallet sin más estado en genesis. **0 prefijos sin identificar.**
+
+### 11.4 Lo que sigue faltando
+
+Igual que en §8: bytecode de los contratos EVM (vault/socket/oracle) y estado live por RPC. Sin esos dos, la pérdida de §11.1 no se puede cuantificar (depende de si el contrato acepta solicitudes ≤ 546 sats) y el "no crítico" sigue siendo condicional a la corrección del contrato.
